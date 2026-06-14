@@ -5,7 +5,7 @@ Route optimization for Indian logistics — delivery fleets with resource-constr
 [![License: ISC](https://img.shields.io/badge/License-ISC-yellow)](LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue)](https://www.typescriptlang.org/)
 [![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](https://nodejs.org/)
-[![CI](https://github.com/anomalyco/vehicle-routing-problem-with-resource-constraints/actions/workflows/ci.yml/badge.svg)](https://github.com/anomalyco/vehicle-routing-problem-with-resource-constraints/actions/workflows/ci.yml)
+[![CI](https://github.com/sachn-cs/vehicle-routing-problem-with-resource-constraints/actions/workflows/ci.yml/badge.svg)](https://github.com/sachn-cs/vehicle-routing-problem-with-resource-constraints/actions/workflows/ci.yml)
 [![Tests](https://img.shields.io/badge/tests-212-passing-green)]()
 
 ## Overview
@@ -234,6 +234,227 @@ const solution = await solver.solve({
   maxGenerations: 20000,
 });
 ```
+
+## Architecture
+
+The solver is organized into four layers:
+
+| Layer | Directory | Responsibility |
+|-------|-----------|----------------|
+| **Core** | `src/core/` | Problem definition, solution model, schedule engine |
+| **Algorithms** | `src/algorithms/` | ALNS metaheuristic, BRKGA evolutionary algorithm, chromosome decoder |
+| **Analytics** | `src/analytics/` | Post-solution analysis, Pareto front computation |
+| **Export** | `src/export/` | GIS serialization (GeoJSON, KML, CSV) |
+
+The `VrpRpdSolver` orchestrator (`src/index.ts:142`) runs a **two-stage metaheuristic**: ALNS first, then BRKGA warm-started from the ALNS solution. In parallel mode, both run concurrently via `worker_threads` and the best result is returned.
+
+```
+Problem ──► ALNS (adaptive destroy/repair) ──► warm-start ──► BRKGA (evolutionary) ──► Best Solution
+                                                    │
+                                              (chromosome encoding
+                                               of ALNS solution,
+                                               15% of initial pop)
+```
+
+## Design Philosophy
+
+- **Strategy pattern** — ALNS destroy/repair operators (`operators.ts:36-278`) are interchangeable functions selected via weighted roulette, enabling easy addition of new operators.
+- **Adaptive weighting** — Operator weights update every segment via reinforcement learning (`alns.ts:255-280`): `w[i] = (1-λ)·w[i] + λ·(score[i]/usage[i])` with λ = 0.1.
+- **Simulated annealing acceptance** — Worsening solutions accepted with probability `exp((cost_current - cost_new) / temperature)` where temperature decays geometrically (`alns.ts:297-301`).
+- **Biased crossover (BRKGA)** — Each child inherits each gene from the elite parent with probability 0.7 (`brkga.ts:272-283`).
+- **Message-passing IPC** — Worker threads communicate via a typed request-response protocol (`island-messenger.ts`), supporting `evolve`, `inject`, and `finish` commands.
+- **Logger DI** — A minimal `Logger` interface allows silent library use or custom logging without coupling to a framework.
+- **Error hierarchy** — `VrpError` → `ValidationError` | `InfeasibleSolutionError` | `AlgorithmConvergenceError` (`errors.ts`).
+
+## Code Decisions
+
+### O(1) Capacity Checks via Incremental RouteLoad
+
+The decoder (`decoder.ts:22-50`) tracks three values per route:
+
+```
+RouteLoad { currentLoad, minDelta, maxDelta }
+```
+
+A new operation is feasible iff:
+
+```
+initialLoadNeeded ≤ capacity  AND  peakLoad ≤ capacity
+```
+
+where `initialLoadNeeded = -newMin` and `peakLoad = initialLoadNeeded + newMax`. This avoids an O(n) scan of the entire route on every insertion.
+
+### Adaptive Removal Sizing
+
+The removal fraction grows from 10% to 45% as stagnation increases (`alns.ts:178-184`):
+
+```
+stagnationRatio = min(1, iterationsSinceImprovement / maxStagnation)
+removalFraction = 0.1 + stagnationRatio × 0.35
+```
+
+### Multi-Restart ALNS
+
+When `iterationsSinceImprovement ≥ maxStagnation` (5% of max iterations, min 25), ALNS restarts (`alns.ts:219-237`):
+- Resets temperature: `temp = initialTemp × 0.5^restartsUsed`
+- Increases cooling rate: `coolingRate = baseCooling × (1 + restartsUsed × 0.02)`
+- Zeroes all operator weights
+- Up to 3 restarts allowed
+
+### Two-Pass Greedy Decoder
+
+The 4n-gene chromosome (`decoder.ts:10-20`) is decoded in two passes:
+
+1. **Delivery pass** — All deliveries scheduled in priority order, assigned to vehicles via `σ` genes
+2. **Schedule calculation** — Determines delivery visit times (needed for pickup feasibility)
+3. **Pickup pass** — Pickups scheduled respecting resource-ready-time constraints
+
+### Chromosome Structure (4n genes, arXiv:2602.23685v2)
+
+```
+Chromosome = { priorities (π), assignments (σ), dependencies (α), transfers (β) }
+```
+
+Each gene is a float in [0, 1). Total size = 4 × numCustomers.
+
+### Warm-Start Encoding
+
+The ALNS solution is encoded into a chromosome (`decoder.ts:217-251`) that seeds 15% of the initial BRKGA population:
+
+```
+priorities[i] = (routeIdx × 100 + position) / (numRoutes × 100)
+assignments[i] = routeIdx / numVehicles
+```
+
+### Schedule Fixed-Point Iteration
+
+Cross-route resource dependencies require iterative schedule computation (`solution.ts:86-159`). The loop visits all routes repeatedly until node times converge (max 1000 iterations), propagating resource-ready-time updates between vehicles.
+
+### Stagnation Resistance in BRKGA
+
+Three mechanisms (`brkga.ts:291-340`):
+- **Elite diversity preservation**: mild mutation on elite copies proportional to stagnation ratio (`rate = min(0.05, stagnationRatio × 0.1)`)
+- **Adaptive mutation rate**: extra mutants = `⌊stagnationRatio × populationSize × 0.05⌋`
+- **Immigrant injection**: 20% of population replaced with fresh random individuals before breaking stagnation
+
+## The Math
+
+### Problem Formulation (VRP-RPD)
+
+Each customer *c* has a delivery node *D_c*, a pickup node *P_c*, and a processing time *p_c*. The resource constraint:
+
+```
+arrivalTime(P_c) ≥ arrivalTime(D_c) + p_c
+```
+
+This creates temporal dependencies: one vehicle may deliver, another may pick up, but pickup cannot start until processing completes.
+
+### Distance and Travel Time
+
+Euclidean distance between nodes (`problem.ts:208`):
+
+```
+distance(i, j) = √((x_i - x_j)² + (y_i - y_j)²)
+```
+
+Travel time: `distance / speed` (optionally modified by traffic model).
+
+### ALNS — Adaptive Weights
+
+Every `segmentSize` iterations (default 50), operator weights are updated (`alns.ts:255-275`):
+
+```
+w[i] = (1 - λ) · w[i] + λ · (score[i] / usage[i])
+```
+
+Score per operator in each iteration:
+- New global best: +33
+- Better than current: +9
+- Accepted via SA: +13
+- Rejected: 0
+
+Probability of selecting operator *i*:
+
+```
+P(i) = w[i] / Σⱼ w[j]
+```
+
+### ALNS — SA Acceptance Probability
+
+```
+P(accept worse) = exp((cost_current - cost_new) / temperature)
+```
+
+Temperature decays: `temp ← temp × coolingRate` each iteration.
+
+### BRKGA — Biased Crossover
+
+Each gene of a child is inherited (`brkga.ts:204-234`):
+
+```
+child[i] = elite[i]       with probability ρ_elite (0.7)
+         = nonElite[i]    with probability 1 - ρ_elite
+```
+
+### BRKGA — Evolution per Generation
+
+1. Sort population by fitness ascending
+2. Copy top `e × popSize` elites (with mild mutation)
+3. Replace bottom `m × popSize` with random mutants
+4. Fill remainder via biased crossover between random elite + random non-elite
+
+### Regret Insertion (ALNS Repair)
+
+For regret-*k* insertion (`operators.ts:364-491`):
+
+```
+regret_k(c) = cost_k(c) - cost_1(c)
+```
+
+The customer with the largest regret (most "urgent") is inserted first. If fewer than *k* routes can accommodate a customer, a fallback cost is used.
+
+### Shaw Relatedness (ALNS Destroy)
+
+Used by the Shaw removal operator (`operators.ts:284-305`):
+
+```
+relatedness(c₁, c₂) = ||D_c₁ - D_c₂||₂ + |time(D_c₁) - time(D_c₂)|
+```
+
+Lower relatedness = more similar = removed together.
+
+### Multi-Objective Pareto Front
+
+A solution is Pareto-optimal if no other solution dominates it (`SolutionComparator.ts:135-185`):
+
+```
+other dominates current iff all objectives ≤ current
+  and strictly better in at least one objective:
+  {makespan, totalDistance, totalCost, totalCO₂}
+```
+
+### Traffic Model
+
+Time-dependent travel speed (`traffic-aware-problem.ts:57-66`):
+
+```
+if departureTime ≥ latest-matching factor.startTime:
+    travelTime = baseTravelTime × factor.multiplier
+else:
+    travelTime = segment.currentTravelTime
+```
+
+Congestion level determined by ratio `newTravelTime / baseTravelTime` (low < 1.2, medium < 1.5, high < 2.0, severe otherwise).
+
+### Resource Transfers
+
+Transfer duration (`resource-transfer.ts:66-121`):
+
+```
+transferDuration = amount × hub.transferTimePerUnit
+```
+
+Each hub enforces a concurrency limit (max simultaneous transfers). Vehicles have directional transfer permissions (`vehicle-with-capabilities.ts:53-64`).
 
 ## Performance Tips
 
