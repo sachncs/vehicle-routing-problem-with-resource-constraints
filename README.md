@@ -5,7 +5,7 @@ Route optimization for Indian logistics — delivery fleets with resource-constr
 [![License: ISC](https://img.shields.io/badge/License-ISC-yellow)](LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue)](https://www.typescriptlang.org/)
 [![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](https://nodejs.org/)
-[![CI](https://github.com/sachn-cs/vehicle-routing-problem-with-resource-constraints/actions/workflows/ci.yml/badge.svg)](https://github.com/sachn-cs/vehicle-routing-problem-with-resource-constraints/actions/workflows/ci.yml)
+[![CI](https://github.com/sachncs/vehicle-routing-problem-with-resource-constraints/actions/workflows/ci.yml/badge.svg)](https://github.com/sachncs/vehicle-routing-problem-with-resource-constraints/actions/workflows/ci.yml)
 [![Tests](https://img.shields.io/badge/tests-212-passing-green)]()
 
 ## Overview

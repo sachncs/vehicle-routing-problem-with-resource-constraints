@@ -73,11 +73,11 @@
     "metaheuristic",
     "optimization"
   ],
-  "author": "Sachin",
+  "author": "Sachin <sachncs@gmail.com>",
   "license": "ISC",
   "repository": {
     "type": "git",
-    "url": "https://github.com/sachn-cs/vehicle-routing-problem-with-resource-constraints.git"
+    "url": "https://github.com/sachncs/vehicle-routing-problem-with-resource-constraints.git"
   },
   "devDependencies": {
     "@rollup/plugin-typescript": "^12.1.0",
